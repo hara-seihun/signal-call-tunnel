@@ -1,3 +1,6 @@
 [submodule "third-party/ringrtc"]
 	path = third-party/ringrtc
 	url = https://github.com/signalapp/ringrtc
+[submodule "third-party/signal-cli"]
+	path = third-party/signal-cli
+	url = https://github.com/visigoth/signal-cli.git
