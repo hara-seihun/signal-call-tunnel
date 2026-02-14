@@ -1,0 +1,3 @@
+[submodule "third-party/ringrtc"]
+	path = third-party/ringrtc
+	url = https://github.com/signalapp/ringrtc

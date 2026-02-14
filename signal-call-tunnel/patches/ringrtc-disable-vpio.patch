@@ -1,0 +1,41 @@
+diff --git a/src/rust/src/webrtc/audio_device_module.rs b/src/rust/src/webrtc/audio_device_module.rs
+index 5e3a6ecf..a9b76c12 100644
+--- a/src/rust/src/webrtc/audio_device_module.rs
++++ b/src/rust/src/webrtc/audio_device_module.rs
+@@ -265,6 +265,18 @@ impl Worker {
+         }
+     }
+
++    /// Returns the stream preferences for cubeb audio streams.
++    ///
++    /// When `RINGRTC_NO_VOICE_PROCESSING` is set, returns `StreamPrefs::NONE`
++    /// to skip macOS VoiceProcessingIO which hangs with virtual audio drivers.
++    fn stream_prefs() -> StreamPrefs {
++        if std::env::var("RINGRTC_NO_VOICE_PROCESSING").is_ok() {
++            StreamPrefs::NONE
++        } else {
++            StreamPrefs::VOICE
++        }
++    }
++
+     fn init_playout(&mut self) -> anyhow::Result<()> {
+         let out_device = if let Some(device) = self.playout_device {
+             device
+@@ -276,7 +288,7 @@ impl Worker {
+             .rate(SAMPLE_FREQUENCY)
+             .channels(2)
+             .layout(cubeb::ChannelLayout::STEREO)
+-            .prefs(StreamPrefs::VOICE)
++            .prefs(Self::stream_prefs())
+             .take();
+         let mut builder = cubeb::StreamBuilder::<OutFrame>::new();
+         let transport = Arc::clone(&self.audio_transport);
+@@ -411,7 +423,7 @@ impl Worker {
+             .rate(SAMPLE_FREQUENCY)
+             .channels(NUM_CHANNELS)
+             .layout(cubeb::ChannelLayout::MONO)
+-            .prefs(StreamPrefs::VOICE)
++            .prefs(Self::stream_prefs())
+             .take();
+
+         let mut builder = cubeb::StreamBuilder::<Frame>::new();
