@@ -309,6 +309,49 @@ class ScreenRecorder:
 # ---------------------------------------------------------------------------
 # Virtual audio device helpers
 # ---------------------------------------------------------------------------
+def check_blackhole_loopback(device_name="signal_input"):
+    """Test that BlackHole loopback works (macOS only).
+
+    Plays a short tone to the device and records from it simultaneously.
+    Returns True if audio passes through, False if the device reads silence.
+    """
+    if not IS_MACOS:
+        return True  # Linux uses PulseAudio, not BlackHole
+
+    import tempfile
+    tone_path = OUTPUT_DIR / "_loopback_tone.wav"
+    rec_path = OUTPUT_DIR / "_loopback_rec.wav"
+
+    # Generate a brief loud tone
+    tone_pcm = generate_tone(1000, 1, amplitude=0.9)
+    setup_output_dir()
+    pcm_to_wav(tone_pcm, tone_path)
+
+    # Record from the device for 2 seconds
+    rec_proc = subprocess.Popen(
+        ["sox", "-t", "coreaudio", device_name,
+         "-b", "16", "-c", "1", "-r", "48000", str(rec_path),
+         "trim", "0", "2"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.3)
+    # Play to the device
+    play_proc = subprocess.Popen(
+        ["sox", str(tone_path), "-t", "coreaudio", device_name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    rec_proc.wait(timeout=10)
+    play_proc.kill()
+    play_proc.wait(timeout=3)
+
+    # Check recorded audio RMS
+    if rec_path.exists() and rec_path.stat().st_size > 44:
+        recorded = wav_to_pcm(rec_path)
+        level = rms_level(recorded)
+        return level > 0.01
+    return False
+
+
 def play_to_device(device_name, wav_path, duration=None):
     """Play a WAV file to a virtual audio input device (platform-aware).
 
@@ -637,6 +680,12 @@ def scenario_e(socket_path):
     if not HAS_GRPC_AUDIO:
         return TestResult("E: Bidirectional audio", False,
                           "grpc_audio not available (run generate_proto.sh first)")
+
+    if IS_MACOS and not check_blackhole_loopback():
+        return TestResult("E: Bidirectional audio", False,
+                          "BlackHole loopback broken — reinstall with: "
+                          "sudo bash third-party/ringrtc/bin/virtual_audio.sh "
+                          "--setup --input-source signal_input --output-sink signal_output")
 
     emu = EmulatorControl(ADB_PATH, output_dir=str(OUTPUT_DIR))
     rpc = SignalRPC(socket_path)
