@@ -73,10 +73,18 @@ class SignalRPC:
         finally:
             self.sock.settimeout(None)
 
+    def subscribe_call_events(self):
+        self._pending_events = getattr(self, "_pending_events", [])
+        req_id = self._send("subscribeCallEvents")
+        return self._wait_response(req_id)
+
     def subscribe_receive(self):
         self._pending_events = getattr(self, "_pending_events", [])
         req_id = self._send("subscribeReceive")
-        return self._wait_response(req_id)
+        result = self._wait_response(req_id)
+        # Also subscribe to call events so wait_for_state() receives callEvent notifications
+        self.subscribe_call_events()
+        return result
 
     def start_call(self, recipient):
         self._pending_events = getattr(self, "_pending_events", [])
