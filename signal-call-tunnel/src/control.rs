@@ -1,5 +1,4 @@
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
@@ -7,14 +6,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use log::{error, info, warn};
 use serde_json::Value;
-use subtle::ConstantTimeEq;
 
 use crate::platform::PlatformEvent;
 
 /// Messages parsed from the parent process.
 #[derive(Debug)]
 pub enum ControlMessage {
-    Auth { token: String },
     CreateOutgoingCall { call_id: u64, peer_id: String },
     Proceed { call_id: u64, ice_servers: Vec<IceServerConfig>, hide_ip: bool },
     ReceivedOffer {
@@ -50,9 +47,6 @@ pub fn parse_message(line: &str) -> Result<ControlMessage> {
     let msg_type = v["type"].as_str().unwrap_or("");
 
     match msg_type {
-        "auth" => Ok(ControlMessage::Auth {
-            token: v["token"].as_str().unwrap_or("").to_string(),
-        }),
         "createOutgoingCall" => Ok(ControlMessage::CreateOutgoingCall {
             call_id: v["callId"].as_u64().unwrap_or(0),
             peer_id: v["peerId"].as_str().unwrap_or("").to_string(),
@@ -129,18 +123,7 @@ pub fn parse_message(line: &str) -> Result<ControlMessage> {
     }
 }
 
-/// Validate the auth token using constant-time comparison.
-pub fn validate_token(received: &str, expected: &str) -> bool {
-    let received_bytes = received.as_bytes();
-    let expected_bytes = expected.as_bytes();
-    if received_bytes.len() != expected_bytes.len() {
-        return false;
-    }
-    received_bytes.ct_eq(expected_bytes).into()
-}
-
-/// Runs the control channel server. Binds a Unix socket, accepts one connection,
-/// validates auth, then reads messages and sends events.
+/// Runs the control channel over stdin (reading) and stdout (writing).
 ///
 /// Returns a channel receiver for incoming control messages and a writer for
 /// sending events to the parent.
@@ -171,15 +154,6 @@ mod tests {
     use super::*;
 
     // --- parse_message tests ---
-
-    #[test]
-    fn parse_auth() {
-        let msg = parse_message(r#"{"type":"auth","token":"secret123"}"#).unwrap();
-        match msg {
-            ControlMessage::Auth { token } => assert_eq!(token, "secret123"),
-            _ => panic!("expected Auth, got {:?}", msg),
-        }
-    }
 
     #[test]
     fn parse_create_outgoing_call() {
@@ -371,105 +345,52 @@ mod tests {
         let result = parse_message(r#"{"callId":1}"#);
         assert!(result.is_err());
     }
-
-    // --- validate_token tests ---
-
-    #[test]
-    fn validate_token_matching() {
-        assert!(validate_token("my-secret-token", "my-secret-token"));
-    }
-
-    #[test]
-    fn validate_token_mismatch() {
-        assert!(!validate_token("wrong-token", "my-secret-token"));
-    }
-
-    #[test]
-    fn validate_token_different_lengths() {
-        assert!(!validate_token("short", "a-much-longer-token"));
-    }
-
-    #[test]
-    fn validate_token_empty() {
-        assert!(validate_token("", ""));
-    }
-
-    #[test]
-    fn validate_token_one_empty() {
-        assert!(!validate_token("", "notempty"));
-        assert!(!validate_token("notempty", ""));
-    }
 }
 
+/// Start the control channel using stdin for reading and stdout for writing.
+///
+/// `stdin_reader` is the remaining stdin after the config line has been read.
 pub fn start_control_channel(
-    control_socket_path: &str,
-    expected_token: &str,
+    stdin_reader: BufReader<std::io::Stdin>,
     input_device_name: &str,
     output_device_name: &str,
 ) -> Result<ControlChannel> {
-    // Remove stale socket file
-    let _ = std::fs::remove_file(control_socket_path);
-
-    let listener = UnixListener::bind(control_socket_path)
-        .with_context(|| format!("failed to bind control socket at {}", control_socket_path))?;
-    info!("Control channel listening on {}", control_socket_path);
-
     let (msg_sender, msg_receiver) = mpsc::channel::<ControlMessage>();
     let (write_sender, write_receiver) = mpsc::channel::<String>();
     let writer = ControlWriter {
         sender: write_sender,
     };
 
-    // Send ready message immediately (parent can connect after this)
+    // Send ready message on stdout
     let ready_msg = format!(
         r#"{{"type":"ready","inputDeviceName":"{}","outputDeviceName":"{}"}}"#,
         input_device_name, output_device_name
     );
+    writer.send_line(&ready_msg);
 
-    let expected_token = expected_token.to_string();
-
-    // Spawn reader thread
+    // Spawn stdout writer thread
     std::thread::spawn(move || {
-        // Accept one connection
-        let (stream, _) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to accept control connection: {}", e);
-                return;
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        for line in write_receiver {
+            if let Err(e) = writeln!(stdout, "{}", line) {
+                error!("Failed to write to stdout: {}", e);
+                break;
             }
-        };
-        info!("Control channel: parent connected");
-
-        let mut writer_stream = match stream.try_clone() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to clone control stream: {}", e);
-                return;
+            if let Err(e) = stdout.flush() {
+                error!("Failed to flush stdout: {}", e);
+                break;
             }
-        };
+        }
+    });
 
-        // Spawn writer thread
-        std::thread::spawn(move || {
-            for line in write_receiver {
-                if let Err(e) = writeln!(writer_stream, "{}", line) {
-                    error!("Failed to write to control channel: {}", e);
-                    break;
-                }
-                if let Err(e) = writer_stream.flush() {
-                    error!("Failed to flush control channel: {}", e);
-                    break;
-                }
-            }
-        });
-
-        let reader = BufReader::new(stream);
-        let mut authenticated = false;
-
-        for line in reader.lines() {
+    // Spawn stdin reader thread
+    std::thread::spawn(move || {
+        for line in stdin_reader.lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    info!("Control channel read ended: {}", e);
+                    info!("stdin read ended: {}", e);
                     break;
                 }
             };
@@ -486,33 +407,12 @@ pub fn start_control_channel(
                 }
             };
 
-            // First message must be auth
-            if !authenticated {
-                if let ControlMessage::Auth { ref token } = msg {
-                    if validate_token(token, &expected_token) {
-                        authenticated = true;
-                        info!("Control channel: authenticated");
-                        continue;
-                    } else {
-                        error!("Control channel: auth failed");
-                        break;
-                    }
-                } else {
-                    error!("Control channel: first message must be auth");
-                    break;
-                }
-            }
-
             if let Err(e) = msg_sender.send(msg) {
                 info!("Control message receiver dropped: {}", e);
                 break;
             }
         }
     });
-
-    // Send the ready message through the writer channel
-    // (it will be sent once the writer thread starts)
-    writer.send_line(&ready_msg);
 
     Ok(ControlChannel {
         msg_receiver,

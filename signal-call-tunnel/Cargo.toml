@@ -12,8 +12,6 @@ env_logger = "0.11"
 base64 = "0.22"
 anyhow = "1"
 
-subtle = "2"
-
 [patch.crates-io]
 # Use Signal's fork of curve25519-dalek for zkgroup compatibility (matches ringrtc workspace).
 curve25519-dalek = { git = 'https://github.com/signalapp/curve25519-dalek', tag = 'signal-curve25519-4.1.3' }

@@ -2,7 +2,8 @@ mod config;
 mod control;
 mod platform;
 
-use std::io::Read;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -51,13 +52,15 @@ fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
-    // Read config from stdin
-    let mut config_str = String::new();
-    std::io::stdin()
-        .read_to_string(&mut config_str)
+    // Read config from the first line of stdin, keep stdin open for control messages
+    let stdin = std::io::stdin();
+    let mut stdin_reader = BufReader::new(stdin);
+    let mut config_line = String::new();
+    stdin_reader
+        .read_line(&mut config_line)
         .context("failed to read config from stdin")?;
     let config: Config =
-        serde_json::from_str(&config_str).context("failed to parse config JSON")?;
+        serde_json::from_str(&config_line).context("failed to parse config JSON")?;
 
     info!(
         "signal-call-tunnel starting: call_id={}, is_outgoing={}",
@@ -93,10 +96,9 @@ fn main() -> Result<()> {
     // Channel for platform events (signaling + state changes)
     let (event_sender, event_receiver) = mpsc::channel::<PlatformEvent>();
 
-    // Start control channel
+    // Start control channel (stdin for commands, stdout for events)
     let control = start_control_channel(
-        &config.control_socket_path,
-        &config.control_token,
+        stdin_reader,
         virtual_audio.input_source(),
         virtual_audio.output_sink(),
     )?;
@@ -203,9 +205,6 @@ fn main() -> Result<()> {
         };
 
         match msg {
-            ControlMessage::Auth { .. } => {
-                // Already handled by control channel
-            }
             ControlMessage::CreateOutgoingCall {
                 call_id: cid,
                 peer_id: pid,

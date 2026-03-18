@@ -1855,7 +1855,6 @@ dependencies = [
  "ringrtc",
  "serde",
  "serde_json",
- "subtle",
 ]
 
 [[package]]
