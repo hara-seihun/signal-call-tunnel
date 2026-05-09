@@ -363,7 +363,7 @@ fn main() -> Result<()> {
                     error!("Failed to process received answer: {}", e);
                 }
             }
-            ControlMessage::ReceivedIce { candidates } => {
+            ControlMessage::ReceivedIce { candidates, sender_device_id } => {
                 debug!("Received {} ICE candidates", candidates.len());
 
                 let ice_candidates: Vec<signaling::IceCandidate> = candidates
@@ -375,7 +375,7 @@ fn main() -> Result<()> {
                     ice: signaling::Ice {
                         candidates: ice_candidates,
                     },
-                    sender_device_id: 1 as DeviceId,
+                    sender_device_id: sender_device_id as DeviceId,
                 };
 
                 if let Err(e) = call_manager.received_ice(

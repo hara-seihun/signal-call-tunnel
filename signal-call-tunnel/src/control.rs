@@ -29,7 +29,7 @@ pub enum ControlMessage {
         sender_identity_key: Vec<u8>,
         receiver_identity_key: Vec<u8>,
     },
-    ReceivedIce { candidates: Vec<Vec<u8>> },
+    ReceivedIce { candidates: Vec<Vec<u8>>, sender_device_id: u32 },
     Accept,
     Hangup,
 }
@@ -115,7 +115,8 @@ pub fn parse_message(line: &str) -> Result<ControlMessage> {
             } else {
                 Vec::new()
             };
-            Ok(ControlMessage::ReceivedIce { candidates })
+            let sender_device_id = v["senderDeviceId"].as_u64().unwrap_or(1) as u32;
+            Ok(ControlMessage::ReceivedIce { candidates, sender_device_id })
         }
         "accept" => Ok(ControlMessage::Accept),
         "hangup" => Ok(ControlMessage::Hangup),
