@@ -1,9 +1,11 @@
 mod config;
 mod control;
 mod platform;
+mod pipe_audio;
 
 use std::io::BufRead;
 use std::io::BufReader;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -17,14 +19,23 @@ use ringrtc::native::{NativeCallContext, NativePlatform, PeerId};
 use ringrtc::virtual_audio::VirtualAudioDevicePair;
 use ringrtc::webrtc::{
     media::{VideoFrame, VideoSink},
-    peer_connection_factory::{AudioConfig, IceServer, PeerConnectionFactory},
+    peer_connection_factory::{AudioBackend, AudioConfig, IceServer, PeerConnectionFactory},
 };
 
-use crate::config::Config;
+use crate::config::{AudioMode, Config};
 use crate::control::{ControlMessage, start_control_channel};
+use crate::pipe_audio::PipeAudioDevice;
 use crate::platform::{
     PlatformEvent, TunnelGroupHandler, TunnelSignalingSender, TunnelStateHandler,
 };
+
+/// Holds the audio backend's lifecycle resources for the duration of a call.
+enum AudioBinding {
+    /// Per-call virtual audio devices owned by the tunnel.
+    Device(VirtualAudioDevicePair),
+    /// Pipe mode keeps no host resources; the socket is owned by the ADM thread.
+    Pipe,
+}
 
 /// Dummy video sink that discards all frames.
 #[derive(Debug)]
@@ -67,41 +78,75 @@ fn main() -> Result<()> {
         config.call_id, config.is_outgoing
     );
 
-    // Create virtual audio devices (signal-call-tunnel owns their lifecycle).
-    // On macOS, BlackHole drivers must be pre-installed with matching names (requires
-    // root), so we default to fixed names.  On Linux, PulseAudio virtual sinks are
-    // created dynamically, so per-call unique names avoid collisions.
-    let input_name = config.input_device_name.clone().unwrap_or_else(|| {
-        if cfg!(target_os = "macos") {
-            "signal_input".to_string()
-        } else {
-            format!("signal_input_{}", config.call_id)
-        }
-    });
-    let output_name = config.output_device_name.clone().unwrap_or_else(|| {
-        if cfg!(target_os = "macos") {
-            "signal_output".to_string()
-        } else {
-            format!("signal_output_{}", config.call_id)
-        }
-    });
+    // Set up the audio backend.  Either real host audio via per-call virtual
+    // devices (default) or a Unix-socket PCM pipe (selected via config or the
+    // SIGNAL_CALL_TUNNEL_AUDIO_MODE env var).  In both cases the names we report
+    // over the control channel tell the parent how to reach the audio:
+    // a device name for the virtual backend, or `unix:<path>` for the pipe.
+    let (audio_config, audio_binding, input_report, output_report) =
+        match config.resolve_audio_mode() {
+            AudioMode::Pipe => {
+                let socket_path = config.pipe_socket_path();
+                info!("Audio mode: pipe (socket {})", socket_path.display());
+                let report = format!("unix:{}", socket_path.display());
+                // Bind the socket now so failures surface before the call starts
+                // and so it exists by the time we report its path to the parent.
+                let device = PipeAudioDevice::new(socket_path)
+                    .context("failed to create pipe audio device")?;
+                let audio_config = AudioConfig {
+                    audio_backend: AudioBackend::Custom(Arc::new(device)),
+                    ..Default::default()
+                };
+                (
+                    audio_config,
+                    AudioBinding::Pipe,
+                    report.clone(),
+                    report,
+                )
+            }
+            AudioMode::Device => {
+                // Create virtual audio devices (signal-call-tunnel owns their
+                // lifecycle). On macOS, BlackHole drivers must be pre-installed
+                // with matching names (requires root), so we default to fixed
+                // names. On Linux, PulseAudio virtual sinks are created
+                // dynamically, so per-call unique names avoid collisions.
+                let input_name = config.input_device_name.clone().unwrap_or_else(|| {
+                    if cfg!(target_os = "macos") {
+                        "signal_input".to_string()
+                    } else {
+                        format!("signal_input_{}", config.call_id)
+                    }
+                });
+                let output_name = config.output_device_name.clone().unwrap_or_else(|| {
+                    if cfg!(target_os = "macos") {
+                        "signal_output".to_string()
+                    } else {
+                        format!("signal_output_{}", config.call_id)
+                    }
+                });
 
-    let virtual_audio = VirtualAudioDevicePair::new(&input_name, &output_name)?;
-    info!(
-        "Virtual audio devices: input={}, output={}",
-        virtual_audio.input_source(),
-        virtual_audio.output_sink()
-    );
+                let virtual_audio = VirtualAudioDevicePair::new(&input_name, &output_name)?;
+                info!(
+                    "Virtual audio devices: input={}, output={}",
+                    virtual_audio.input_source(),
+                    virtual_audio.output_sink()
+                );
+                let input_report = virtual_audio.input_source().to_string();
+                let output_report = virtual_audio.output_sink().to_string();
+                (
+                    AudioConfig::default(),
+                    AudioBinding::Device(virtual_audio),
+                    input_report,
+                    output_report,
+                )
+            }
+        };
 
     // Channel for platform events (signaling + state changes)
     let (event_sender, event_receiver) = mpsc::channel::<PlatformEvent>();
 
     // Start control channel (stdin for commands, stdout for events)
-    let control = start_control_channel(
-        stdin_reader,
-        virtual_audio.input_source(),
-        virtual_audio.output_sink(),
-    )?;
+    let control = start_control_channel(stdin_reader, &input_report, &output_report)?;
 
     // Show WebRTC logs while debugging
     #[cfg(debug_assertions)]
@@ -116,47 +161,50 @@ fn main() -> Result<()> {
     // Safety: called before any threads are spawned, single-threaded at this point.
     unsafe { std::env::set_var("RINGRTC_NO_VOICE_PROCESSING", "1") };
 
-    let audio_config = AudioConfig::default();
     let mut pcf = PeerConnectionFactory::new(&audio_config, false, "", None)?;
 
-    // Wait for cubeb to enumerate the virtual devices
-    loop {
-        std::thread::sleep(Duration::from_millis(100));
-        if pcf
-            .get_audio_playout_devices()
-            .is_ok_and(|d| !d.is_empty())
-            && pcf
-                .get_audio_recording_devices()
+    // The pipe backend exposes a single synthetic device and needs no
+    // enumeration or selection; only the virtual-device backend does.
+    if let AudioBinding::Device(virtual_audio) = &audio_binding {
+        // Wait for cubeb to enumerate the virtual devices
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if pcf
+                .get_audio_playout_devices()
                 .is_ok_and(|d| !d.is_empty())
-        {
-            break;
+                && pcf
+                    .get_audio_recording_devices()
+                    .is_ok_and(|d| !d.is_empty())
+            {
+                break;
+            }
         }
+
+        // Select virtual devices by name.
+        //
+        // We can't use set_audio_*_device_by_id() because the ADM matches on the
+        // cubeb unique_id (e.g. "signal_input2ch_UID"), not the friendly name we
+        // know ("signal_input").  Instead, enumerate and find the index by name.
+        let input_name = virtual_audio.input_source();
+        let recording_devices = pcf.get_audio_recording_devices()?;
+        let recording_index = recording_devices
+            .iter()
+            .position(|d| d.name == input_name)
+            .ok_or_else(|| anyhow::anyhow!("recording device '{}' not found", input_name))?
+            as u16;
+        pcf.set_audio_recording_device(recording_index)?;
+        info!("Selected recording device: index={}, name={}", recording_index, input_name);
+
+        let output_name = virtual_audio.output_sink();
+        let playout_devices = pcf.get_audio_playout_devices()?;
+        let playout_index = playout_devices
+            .iter()
+            .position(|d| d.name == output_name)
+            .ok_or_else(|| anyhow::anyhow!("playout device '{}' not found", output_name))?
+            as u16;
+        pcf.set_audio_playout_device(playout_index)?;
+        info!("Selected playout device: index={}, name={}", playout_index, output_name);
     }
-
-    // Select virtual devices by name.
-    //
-    // We can't use set_audio_*_device_by_id() because the ADM matches on the
-    // cubeb unique_id (e.g. "signal_input2ch_UID"), not the friendly name we
-    // know ("signal_input").  Instead, enumerate and find the index by name.
-    let input_name = virtual_audio.input_source();
-    let recording_devices = pcf.get_audio_recording_devices()?;
-    let recording_index = recording_devices
-        .iter()
-        .position(|d| d.name == input_name)
-        .ok_or_else(|| anyhow::anyhow!("recording device '{}' not found", input_name))?
-        as u16;
-    pcf.set_audio_recording_device(recording_index)?;
-    info!("Selected recording device: index={}, name={}", recording_index, input_name);
-
-    let output_name = virtual_audio.output_sink();
-    let playout_devices = pcf.get_audio_playout_devices()?;
-    let playout_index = playout_devices
-        .iter()
-        .position(|d| d.name == output_name)
-        .ok_or_else(|| anyhow::anyhow!("playout device '{}' not found", output_name))?
-        as u16;
-    pcf.set_audio_playout_device(playout_index)?;
-    info!("Selected playout device: index={}, name={}", playout_index, output_name);
 
     // Create platform with our trait implementations
     let signaling_sender = Box::new(TunnelSignalingSender {
