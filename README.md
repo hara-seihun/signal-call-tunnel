@@ -43,12 +43,39 @@ cargo install --path signal-call-tunnel/signal-call-tunnel
 
 ```bash
 git submodule update --init
-cd signal-call-tunnel && cargo build --release
+./build.sh            # release build (recommended)
+```
+
+`build.sh` applies the required RingRTC patches (see below) and then builds, so a
+single invocation always succeeds. It also accepts cargo subcommands:
+
+```bash
+./build.sh --debug    # debug build
+./build.sh test       # cargo test
 ```
 
 The first build downloads a prebuilt WebRTC library (~100 MB) from Signal's artifact server. Subsequent builds use the cached copy.
 
-The build script (`build.rs`) automatically applies a patch to RingRTC that disables macOS VoiceProcessingIO (VPIO) for virtual audio devices. The patch is idempotent.
+### RingRTC patches
+
+The RingRTC submodule is kept pristine in git. Two patches under
+`signal-call-tunnel/patches/` are applied to its working tree at build time:
+
+1. `ringrtc-disable-vpio.patch` — disables macOS VoiceProcessingIO (VPIO), which
+   hangs with virtual audio devices.
+2. `ringrtc-custom-audio-backend.patch` — adds a generic `CustomAudioDevice`
+   extension point that the pipe audio backend (`src/pipe_audio.rs`) plugs into.
+
+Order matters: the custom-audio-backend patch is generated against a tree that
+already has the VPIO patch applied. Both patch applications are idempotent.
+
+`build.rs` can also apply these patches as a fallback if you run `cargo build`
+directly. However, cargo compiles the RingRTC dependency *before* running
+`build.rs`, and the patches change RingRTC's public API — so a direct
+`cargo build` on a pristine checkout must be run **twice** (the first run applies
+the patches and stops with an explanatory message). Use `./build.sh` to avoid
+this.
+
 
 ## Running
 
