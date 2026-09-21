@@ -4,6 +4,8 @@ mod platform;
 
 use std::io::BufRead;
 use std::io::BufReader;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -185,6 +187,11 @@ fn main() -> Result<()> {
 
     info!("CallManager initialized, entering event loop");
 
+    // Register SIGTERM handler. The flag is checked every 100 ms in the event
+    // loop so the process exits cleanly and Drop runs on virtual_audio.
+    let terminate = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&terminate))?;
+
     // Spawn a thread to forward platform events to control channel
     let control_writer = control.writer.clone();
     std::thread::spawn(move || {
@@ -195,6 +202,10 @@ fn main() -> Result<()> {
 
     // Main event loop: process control messages
     loop {
+        if terminate.load(Ordering::Relaxed) {
+            info!("Received SIGTERM, exiting cleanly");
+            break;
+        }
         let msg = match control.msg_receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(msg) => msg,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
